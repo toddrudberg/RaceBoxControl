@@ -51,7 +51,7 @@
       btnConnect.TabIndex = 1;
       btnConnect.Text = "button2";
       btnConnect.UseVisualStyleBackColor = true;
-      btnConnect.Click += btnConnect_Click;
+      btnConnect.Click += btnDownloadAll_Click;
       // 
       // lstDevices
       // 

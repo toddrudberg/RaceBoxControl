@@ -30,15 +30,18 @@ namespace Undaunted.AirRacing.IO
     public void Append(byte[] rec80)
     {
       if (rec80 is null || rec80.Length != 80) return;
-
+      bool justTheHex = true;
       if (!_wroteHeader)
       {
-        _sw.WriteLine(string.Join(",",
-          "iTOW_ms", "fixType", "numSV",
-          "lat_deg", "lon_deg", "height_m",
-          "hAcc_m", "vAcc_m",
-          "gSpeed_mps", "head_deg",
-          "raw80_hex"));
+        if (!justTheHex)
+        {
+          _sw.WriteLine(string.Join(",",
+            "iTOW_ms", "UTC", "fixType", "numSV",
+            "lat_deg", "lon_deg", "height_m",
+            "hAcc_m", "vAcc_m",
+            "gSpeed_mps", "head_deg",
+            "raw80_hex"));
+        }
         _wroteHeader = true;
       }
 
@@ -57,6 +60,13 @@ namespace Undaunted.AirRacing.IO
       uint vAccMm = ReadU32(rec80, 44);
       int gSpMmS = ReadI32(rec80, 60);
       int hdgE5 = ReadI32(rec80, 68);
+      var (tsOk, tsUtc) = DecodeUtcTimestamp(rec80);
+      string tsSec = "";
+      if (tsOk)
+      {
+        var unixSeconds = (tsUtc - DateTimeOffset.UnixEpoch).TotalSeconds;
+        tsSec = unixSeconds.ToString("F3", CultureInfo.InvariantCulture);
+      }
 
       double lat = latE7 / 1e7;
       double lon = lonE7 / 1e7;
@@ -69,19 +79,56 @@ namespace Undaunted.AirRacing.IO
       var rawHex = BitConverter.ToString(rec80).Replace("-", "");
       lock (_lock)
       {
-        _sw.WriteLine(string.Join(",",
-          iTOW.ToString(CultureInfo.InvariantCulture),
-          fix.ToString(CultureInfo.InvariantCulture),
-          numSV.ToString(CultureInfo.InvariantCulture),
-          lat.ToString("G17", CultureInfo.InvariantCulture),
-          lon.ToString("G17", CultureInfo.InvariantCulture),
-          hM.ToString("G17", CultureInfo.InvariantCulture),
-          hAcc.ToString("G17", CultureInfo.InvariantCulture),
-          vAcc.ToString("G17", CultureInfo.InvariantCulture),
-          gSp.ToString("G17", CultureInfo.InvariantCulture),
-          hdg.ToString("G17", CultureInfo.InvariantCulture),
-          rawHex));
+        if (justTheHex)
+        {
+          _sw.WriteLine(string.Join(",", rawHex));
+        }
+        else
+        {
+          _sw.WriteLine(string.Join(",",
+            iTOW.ToString(CultureInfo.InvariantCulture),
+            tsSec,
+            fix.ToString(CultureInfo.InvariantCulture),
+            numSV.ToString(CultureInfo.InvariantCulture),
+            lat.ToString("G17", CultureInfo.InvariantCulture),
+            lon.ToString("G17", CultureInfo.InvariantCulture),
+            hM.ToString("G17", CultureInfo.InvariantCulture),
+            hAcc.ToString("G17", CultureInfo.InvariantCulture),
+            vAcc.ToString("G17", CultureInfo.InvariantCulture),
+            gSp.ToString("G17", CultureInfo.InvariantCulture),
+            hdg.ToString("G17", CultureInfo.InvariantCulture),
+            rawHex));
+        }
       }
+    }
+
+    private static (bool ok, DateTimeOffset utc) DecodeUtcTimestamp(byte[] rec80)
+    {
+      // UBX-NAV-PVT layout offsets:
+      // year U2@4, month U1@6, day U1@7, hour U1@8, min U1@9, sec U1@10, valid U1@11,
+      // tAcc U4@12, nano I4@16
+      ushort year = ReadU16(rec80, 4);
+      byte month = rec80[6];
+      byte day = rec80[7];
+      byte hour = rec80[8];
+      byte minute = rec80[9];
+      byte second = rec80[10];
+      byte valid = rec80[11]; // bit0: validDate, bit1: validTime, bit2: fully resolved (leap secs)
+      int nano = ReadI32(rec80, 16); // signed ns, may be negative
+
+      bool hasDate = (valid & 0x01) != 0;
+      bool hasTime = (valid & 0x02) != 0;
+
+      if (!hasDate || !hasTime)
+        return (false, default); // timestamp not valid for this fix
+
+      // Normalize nano so it’s within [0, 1e9) relative to the given second.
+      // .NET ticks are 100 ns.
+      long ticks = nano / 100; // ns -> ticks; negative values okay
+                               // Build base second-aligned UTC time
+      var baseUtc = new DateTime(year, month, day, hour, minute, Math.Clamp(second, (byte)0, (byte)59), DateTimeKind.Utc);
+      var dt = baseUtc.AddTicks(ticks);
+      return (true, new DateTimeOffset(dt));
     }
 
     public void Dispose()
@@ -89,7 +136,7 @@ namespace Undaunted.AirRacing.IO
       _sw.Flush();
       _sw.Dispose();
     }
-
+    private static ushort ReadU16(byte[] b, int o) => (ushort)(b[o] | (b[o + 1] << 8));
     private static uint ReadU32(byte[] b, int o) => (uint)(b[o] | (b[o + 1] << 8) | (b[o + 2] << 16) | (b[o + 3] << 24));
     private static int ReadI32(byte[] b, int o) => b[o] | (b[o + 1] << 8) | (b[o + 2] << 16) | (b[o + 3] << 24);
   }
@@ -101,8 +148,13 @@ namespace Undaunted.AirRacing.IO
     private static readonly Guid TxCharGuid = Guid.Parse("6E400003-B5A3-F393-E0A9-E50E24DCCA9E"); // notify
 
     private BluetoothLEDevice? _device;
-    private GattCharacteristic? _rx, _tx;
-    private readonly ConcurrentQueue<byte> _fifo = new();
+    private GattCharacteristic? _rx; // write w/o response
+    private GattCharacteristic? _tx; // notify
+    private GattSession? _session;   // service session (dispose to force link down)
+    private GattDeviceService? _svc;
+
+    private readonly List<byte> _buf = new(8192);
+    private readonly SemaphoreSlim _connectGate = new(1, 1);
 
     public event Action<string>? Log;
     public event Action<RaceboxStatus>? StatusReceived;
@@ -115,37 +167,36 @@ namespace Undaunted.AirRacing.IO
     public string? DeviceName { get; private set; }
     public ulong BluetoothAddress { get; private set; }
 
-    private readonly List<byte> _buf = new(8192);
+    private volatile bool _downloading = false;
+    private int _expected = 0, _received = 0;
+    private long _lastDataTick = 0;
 
-    // --------- Scan (Windows watcher) ----------
+    // ---------------- Scan ----------------
     public async Task<IReadOnlyList<(ulong addr, string name)>> ListRaceboxesAsync(TimeSpan timeout)
     {
       var results = new Dictionary<ulong, string>();
-      var tcs = new TaskCompletionSource<bool>();
-      using var cts = new CancellationTokenSource(timeout);
+      var done = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
 
+      using var cts = new CancellationTokenSource(timeout);
       var watcher = new BluetoothLEAdvertisementWatcher { ScanningMode = BluetoothLEScanningMode.Active };
+
       watcher.Received += (_, e) =>
       {
         var name = e.Advertisement.LocalName ?? "";
         if (name.StartsWith("RaceBox", StringComparison.OrdinalIgnoreCase))
         {
           results[e.BluetoothAddress] = name;
-          Log?.Invoke($"BLE: {name} [{e.BluetoothAddress:X}]");
+          Log?.Invoke($"BLE: {name} [{e.BluetoothAddress:X}] RSSI={e.RawSignalStrengthInDBm} dBm");
         }
       };
-      watcher.Stopped += (_, __) => tcs.TrySetResult(true);
+      watcher.Stopped += (_, __) => done.TrySetResult(true);
 
       watcher.Start();
-      try
-      {
-        await Task.Delay(timeout, cts.Token);
-      }
-      catch { /* timeout used as stop signal */ }
+      try { await Task.Delay(timeout, cts.Token); } catch { /* use timeout as stop */ }
       watcher.Stop();
-      await tcs.Task;
+      await done.Task;
 
-      if (results.Count == 0) Log?.Invoke("Scan timeout with no RaceBox found.");
+      if (results.Count == 0) Log?.Invoke("Scan complete: no RaceBox found.");
       return results.Select(kv => (kv.Key, kv.Value)).ToList();
     }
 
@@ -156,35 +207,66 @@ namespace Undaunted.AirRacing.IO
       await ConnectAsync(found[0].addr, found[0].name);
     }
 
-    // --------- Connect ----------
+    // ---------------- Connect ----------------
     public async Task ConnectAsync(ulong bluetoothAddress, string? knownName = null)
     {
-      _device = await BluetoothLEDevice.FromBluetoothAddressAsync(bluetoothAddress)
-                ?? throw new Exception("Failed to open device");
-      DeviceName = knownName ?? _device.Name;
-      BluetoothAddress = bluetoothAddress;
+      await _connectGate.WaitAsync().ConfigureAwait(false);
+      try
+      {
+        // If switching devices, hard disconnect first
+        if (_device != null && BluetoothAddress != 0 && BluetoothAddress != bluetoothAddress)
+          await DisconnectAsync().ConfigureAwait(false);
 
-      var svcRes = await _device.GetGattServicesForUuidAsync(UartService, BluetoothCacheMode.Uncached);
-      var svc = svcRes?.Services?.FirstOrDefault() ?? throw new Exception("UART service not found");
+        // If already connected to the same device, no-op
+        if (_device != null && BluetoothAddress == bluetoothAddress)
+          return;
 
-      var chars = await svc.GetCharacteristicsAsync(BluetoothCacheMode.Uncached);
-      _rx = chars.Characteristics.FirstOrDefault(c => c.Uuid == RxCharGuid) ?? throw new Exception("RX not found");
-      _tx = chars.Characteristics.FirstOrDefault(c => c.Uuid == TxCharGuid) ?? throw new Exception("TX not found");
+        _device = await BluetoothLEDevice.FromBluetoothAddressAsync(bluetoothAddress)
+                  ?? throw new Exception("Failed to open device");
+        DeviceName = knownName ?? _device.Name;
+        BluetoothAddress = bluetoothAddress;
 
-      var st = await _tx.WriteClientCharacteristicConfigurationDescriptorAsync(
-                 GattClientCharacteristicConfigurationDescriptorValue.Notify);
-      if (st != GattCommunicationStatus.Success) throw new Exception("Failed to enable notifications");
+        _device.ConnectionStatusChanged += (_, __) =>
+          Log?.Invoke($"BLE status: {_device.ConnectionStatus}");
 
-      _tx.ValueChanged += TxOnValueChanged;
-      Log?.Invoke($"Connected: {DeviceName}");
+        var svcRes = await _device.GetGattServicesForUuidAsync(UartService, BluetoothCacheMode.Uncached);
+        var svc = svcRes?.Services?.FirstOrDefault() ?? throw new Exception("UART service not found");
+
+        _session = svc.Session;                // hold the session so we can dispose it
+        _session.MaintainConnection = false;   // we don't want the OS pinning the link
+        _svc = svc;
+
+        var chars = await svc.GetCharacteristicsAsync(BluetoothCacheMode.Uncached);
+        _rx = chars.Characteristics.FirstOrDefault(c => c.Uuid == RxCharGuid) ?? throw new Exception("RX not found");
+        _tx = chars.Characteristics.FirstOrDefault(c => c.Uuid == TxCharGuid) ?? throw new Exception("TX not found");
+
+        var st = await _tx.WriteClientCharacteristicConfigurationDescriptorAsync(
+                   GattClientCharacteristicConfigurationDescriptorValue.Notify);
+        if (st != GattCommunicationStatus.Success)
+          throw new Exception("Failed to enable notifications");
+
+        _tx.ValueChanged += TxOnValueChanged;
+
+        Log?.Invoke($"Connected: {DeviceName} [{BluetoothAddress:X}]");
+      }
+      finally
+      {
+        _connectGate.Release();
+      }
     }
 
-    // --------- Commands ----------
+    // ---------------- Commands ----------------
     public Task QueryStandaloneStatusAsync() =>
       WriteUbxAsync(BuildUbx(0xFF, 0x22, ReadOnlySpan<byte>.Empty));
 
-    public Task BeginDownloadAsync() =>
-      WriteUbxAsync(BuildUbx(0xFF, 0x23, ReadOnlySpan<byte>.Empty));
+    public async Task BeginDownloadAsync()
+    {
+      _downloading = true;
+      _expected = 0;
+      _received = 0;
+      _lastDataTick = Environment.TickCount64;
+      await WriteUbxAsync(BuildUbx(0xFF, 0x23, ReadOnlySpan<byte>.Empty));
+    }
 
     public Task CancelDownloadAsync() =>
       WriteUbxAsync(BuildUbx(0xFF, 0x23, stackalloc byte[] { 0xFF }));
@@ -210,7 +292,7 @@ namespace Undaunted.AirRacing.IO
       return WriteUbxAsync(BuildUbx(0xFF, 0x25, pl));
     }
 
-    // --------- Low-level plumbing ----------
+    // ---------------- Low level ----------------
     private async Task WriteUbxAsync(byte[] packet)
     {
       if (_rx is null) throw new InvalidOperationException("Not connected");
@@ -232,34 +314,27 @@ namespace Undaunted.AirRacing.IO
 
         lock (_buf)
         {
-          // Find 0xB5 0x62 safely (scan indices, not elements)
+          // find sync
           for (int i = 0; i < _buf.Count - 1; i++)
           {
-            if (_buf[i] == 0xB5 && _buf[i + 1] == 0x62)
-            {
-              start = i;
-              break;
-            }
+            if (_buf[i] == 0xB5 && _buf[i + 1] == 0x62) { start = i; break; }
           }
 
           if (start < 0)
           {
-            // keep at most one trailing byte (in case it's 0xB5)
             if (_buf.Count > 1) _buf.RemoveRange(0, _buf.Count - 1);
             return;
           }
 
-          // Need at least header+cls/id+len (6 bytes)
-          if (_buf.Count - start < 6) return;
+          if (_buf.Count - start < 6) return; // need header
 
           byte cls = _buf[start + 2];
           byte id = _buf[start + 3];
           int len = _buf[start + 4] | (_buf[start + 5] << 8);
-          int frameLen = 6 + len + 2; // header+len + payload + checksum
+          int frameLen = 6 + len + 2;
 
-          if (_buf.Count - start < frameLen) return; // wait for more
+          if (_buf.Count - start < frameLen) return; // wait more
 
-          // checksum over cls,id,lenL,lenH,payload
           byte ckA = 0, ckB = 0;
           for (int i = start + 2; i < start + 6 + len; i++) { ckA += _buf[i]; ckB += ckA; }
           byte expA = _buf[start + 6 + len];
@@ -267,12 +342,10 @@ namespace Undaunted.AirRacing.IO
 
           if (ckA != expA || ckB != expB)
           {
-            // bad frame → skip this header and continue scanning
-            _buf.RemoveRange(0, start + 2); // drop up to (but keep) 0x62 as next candidate tail
+            _buf.RemoveRange(0, start + 2); // resync
             continue;
           }
 
-          // valid frame → extract payload and drop consumed bytes
           var payload = new byte[len];
           _buf.CopyTo(start + 6, payload, 0, len);
           _buf.RemoveRange(0, start + frameLen);
@@ -284,11 +357,53 @@ namespace Undaunted.AirRacing.IO
 
     private void HandleFrame(byte cls, byte id, byte[] payload)
     {
-      if (cls == 0xFF && id == 0x02 && payload.Length == 2)
+      if (_downloading) _lastDataTick = Environment.TickCount64;
+
+      if (cls == 0xFF && id == 0x02 && payload.Length == 2) // ACK
+      {
         AckReceived?.Invoke(new RaceboxAck(payload[0], payload[1]));
-      else if (cls == 0xFF && id == 0x03 && payload.Length == 2)
+        if (_downloading && payload[0] == 0xFF && payload[1] == 0x23)
+        {
+          _downloading = false;
+          DownloadCompleted?.Invoke();
+        }
+        return;
+      }
+
+      if (cls == 0xFF && id == 0x03 && payload.Length == 2) // NACK
+      {
         NackReceived?.Invoke(new RaceboxNack(payload[0], payload[1]));
-      else if (cls == 0xFF && id == 0x22 && payload.Length == 12)
+        if (_downloading && payload[0] == 0xFF && payload[1] == 0x23)
+        {
+          _downloading = false;
+          DownloadCompleted?.Invoke();
+        }
+        return;
+      }
+
+      if (cls == 0xFF && id == 0x23 && payload.Length == 4)
+      {
+        _expected = BitConverter.ToInt32(payload, 0);
+        _received = 0;
+        DownloadProgress?.Invoke(_received, _expected);
+        return;
+      }
+
+      if (cls == 0xFF && id == 0x21 && payload.Length == 80)
+      {
+        _received++;
+        HistoryRecord80B?.Invoke(payload);
+        if (_expected > 0) DownloadProgress?.Invoke(_received, _expected);
+
+        if (_downloading && _expected > 0 && _received >= _expected)
+        {
+          _downloading = false;
+          DownloadCompleted?.Invoke();
+        }
+        return;
+      }
+
+      if (cls == 0xFF && id == 0x22 && payload.Length == 12)
       {
         var st = new RaceboxStatus
         {
@@ -300,99 +415,10 @@ namespace Undaunted.AirRacing.IO
           TotalCapacity = BitConverter.ToUInt32(payload, 8)
         };
         StatusReceived?.Invoke(st);
+        return;
       }
-      else if (cls == 0xFF && id == 0x23 && payload.Length == 4)
-      {
-        var expected = BitConverter.ToInt32(payload, 0);
-        DownloadProgress?.Invoke(0, expected);
-      }
-      else if (cls == 0xFF && id == 0x21 && payload.Length == 80)
-      {
-        HistoryRecord80B?.Invoke(payload);
-      }
-      else if (cls == 0xFF && id == 0x26 && payload.Length == 12)
-      {
-        // optional: state-change packets during dump (useful later for session splitting)
-      }
-    }
-    private int _expected = 0, _received = 0;
 
-    private void ParseQueue()
-    {
-      while (TryReadOneFrame(_fifo, out var cls, out var id, out var payload))
-      {
-        if (cls == 0xFF && id == 0x02 && payload.Length == 2)
-          AckReceived?.Invoke(new RaceboxAck(payload[0], payload[1]));
-        else if (cls == 0xFF && id == 0x03 && payload.Length == 2)
-          NackReceived?.Invoke(new RaceboxNack(payload[0], payload[1]));
-        else if (cls == 0xFF && id == 0x22 && payload.Length == 12)
-        {
-          var st = new RaceboxStatus
-          {
-            Recording = payload[0] != 0,
-            MemoryPercent = payload[1],
-            SecurityEnabled = (payload[2] & 0x01) != 0,
-            SecurityUnlocked = (payload[2] & 0x02) != 0,
-            StoredRecords = BitConverter.ToUInt32(payload, 4),
-            TotalCapacity = BitConverter.ToUInt32(payload, 8)
-          };
-          StatusReceived?.Invoke(st);
-        }
-        else if (cls == 0xFF && id == 0x23 && payload.Length == 4)
-        {
-          _expected = BitConverter.ToInt32(payload, 0);
-          _received = 0;
-          DownloadProgress?.Invoke(_received, _expected);
-        }
-        else if (cls == 0xFF && id == 0x21 && payload.Length == 80)
-        {
-          _received++;
-          HistoryRecord80B?.Invoke(payload);
-          if (_expected > 0) DownloadProgress?.Invoke(_received, _expected);
-          if (_expected > 0 && _received >= _expected) DownloadCompleted?.Invoke();
-        }
-      }
-    }
-
-    private static bool TryReadOneFrame(ConcurrentQueue<byte> q, out byte cls, out byte id, out byte[] payload)
-    {
-      cls = id = 0; payload = Array.Empty<byte>();
-      while (q.TryDequeue(out var b))
-      {
-        if (b != 0xB5) continue;
-        if (!q.TryDequeue(out var b2)) { q.Enqueue(b); return false; }
-        if (b2 != 0x62) continue;
-
-        if (!TryDequeue(q, 4, out var hdr)) { Requeue(q, new byte[] { 0xB5, 0x62 }.Concat(hdr).ToArray()); return false; }
-        cls = hdr[0]; id = hdr[1];
-        int len = hdr[2] | (hdr[3] << 8);
-
-        if (!TryDequeue(q, len + 2, out var rest)) { Requeue(q, new byte[] { 0xB5, 0x62, cls, id, hdr[2], hdr[3] }.Concat(rest).ToArray()); return false; }
-
-        var pl = rest.AsSpan(0, len).ToArray();
-        byte ckA = rest[len], ckB = rest[len + 1];
-
-        byte cA = 0, cB = 0;
-        void Sum(byte v) { cA += v; cB += cA; }
-        Sum(cls); Sum(id); Sum((byte)(len & 0xFF)); Sum((byte)(len >> 8));
-        foreach (var v in pl) Sum(v);
-
-        if (cA != ckA || cB != ckB) { payload = Array.Empty<byte>(); continue; }
-        payload = pl;
-        return true;
-      }
-      return false;
-
-      static bool TryDequeue(ConcurrentQueue<byte> q, int count, out byte[] data)
-      {
-        data = new byte[count];
-        for (int i = 0; i < count; i++) if (!q.TryDequeue(out data[i])) { data = data.AsSpan(0, i).ToArray(); return false; }
-        return true;
-      }
-      static void Requeue(ConcurrentQueue<byte> q, byte[] bytes)
-      {
-        for (int i = bytes.Length - 1; i >= 0; i--) q.Enqueue(bytes[i]);
-      }
+      // 0xFF/0x26 (optional state change) ignored here
     }
 
     private static byte[] BuildUbx(byte cls, byte id, ReadOnlySpan<byte> payload)
@@ -406,30 +432,85 @@ namespace Undaunted.AirRacing.IO
       buf[^2] = ckA; buf[^1] = ckB; return buf;
     }
 
-    public async ValueTask DisposeAsync()
+    // ---------------- Teardown ----------------
+    public async Task DisconnectAsync()
     {
       try
       {
+        if (_downloading)
+        {
+          try { await CancelDownloadAsync(); } catch { }
+          _downloading = false;
+        }
+
+        // turn off notifications first (retry once helps if mid-flight)
         if (_tx != null)
         {
-          await _tx.WriteClientCharacteristicConfigurationDescriptorAsync(GattClientCharacteristicConfigurationDescriptorValue.None);
+          try
+          {
+            var st = await _tx.WriteClientCharacteristicConfigurationDescriptorAsync(
+                       GattClientCharacteristicConfigurationDescriptorValue.None);
+            if (st != GattCommunicationStatus.Success)
+            {
+              await Task.Delay(100);
+              await _tx.WriteClientCharacteristicConfigurationDescriptorAsync(
+                GattClientCharacteristicConfigurationDescriptorValue.None);
+            }
+          }
+          catch { }
+
           _tx.ValueChanged -= TxOnValueChanged;
+          //try { _tx.Dispose(); } catch { }
+          try { _tx.Service?.Dispose(); } catch { }
+          _tx = null;
         }
+
+        // RX is write-only (NUS); dispose and clear
+        if (_rx != null)
+        {
+          //try { _rx.Dispose(); } catch { }
+          try { _rx.Service?.Dispose(); } catch { }
+          _rx = null;
+        }
+
+        if (_session != null)
+        {
+          try { _session.Dispose(); } catch { }
+          _session = null;
+        }
+
+        if (_device != null)
+        {
+          try { _device.Dispose(); } catch { }
+          _device = null;
+        }
+
+        // clear identity and buffers
+        DeviceName = null;
+        BluetoothAddress = 0;
+        lock (_buf) _buf.Clear();
+        _expected = 0; _received = 0; _lastDataTick = 0;
       }
-      catch { }
-      _device?.Dispose();
+      catch
+      {
+        // best-effort
+      }
     }
+
+    public ValueTask DisposeAsync() => new(DisconnectAsync());
   }
 
-  public record RaceboxAck(byte opClass, byte opId);
-  public record RaceboxNack(byte opClass, byte opId);
-  public record RaceboxStatus
+  // -------- helper models you referenced --------
+  public sealed class RaceboxStatus
   {
-    public bool Recording { get; init; }
-    public byte MemoryPercent { get; init; }
-    public bool SecurityEnabled { get; init; }
-    public bool SecurityUnlocked { get; init; }
-    public uint StoredRecords { get; init; }
-    public uint TotalCapacity { get; init; }
+    public bool Recording { get; set; }
+    public byte MemoryPercent { get; set; }
+    public bool SecurityEnabled { get; set; }
+    public bool SecurityUnlocked { get; set; }
+    public uint StoredRecords { get; set; }
+    public uint TotalCapacity { get; set; }
   }
+
+  public readonly record struct RaceboxAck(byte Cls, byte Id);
+  public readonly record struct RaceboxNack(byte Cls, byte Id);
 }
